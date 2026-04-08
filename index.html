@@ -1373,6 +1373,7 @@ Nur JSON. Kein Kommentar.`;
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                     body: new URLSearchParams({
                         client_id: GDRIVE_CLIENT_ID,
+                        client_secret: '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',
                         code: code,
                         code_verifier: verifier,
                         grant_type: 'authorization_code',
@@ -1433,6 +1434,7 @@ Nur JSON. Kein Kommentar.`;
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                     body: new URLSearchParams({
                         client_id: GDRIVE_CLIENT_ID,
+                        client_secret: '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',
                         refresh_token: tokenInfo.refresh_token,
                         grant_type: 'refresh_token'
                     })
