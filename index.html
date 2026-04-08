@@ -1164,10 +1164,15 @@ Nur JSON. Kein Kommentar.`;
         const GDRIVE_SCOPES = 'https://www.googleapis.com/auth/drive.file';
         const GDRIVE_TOKEN_KEY = 'loras_gdrive_token';
         const GDRIVE_INDEX_TOGGLE_KEY = 'loras_index_toggle';
+        const GDRIVE_VERIFIER_KEY = 'loras_gdrive_code_verifier'; // [FIX 1] Dedicated key in localStorage
 
-        // Drive file names
+        // Drive file names & folder
+        const DRIVE_FOLDER_NAME = 'Loras-Memory';  // [FIX 2] Dedicated folder
         const DRIVE_MAIN_FILE = 'last-frame.json';
         const DRIVE_INDEX_FILE = 'last-frame-index.json';
+
+        // Login hint for Loras Soong account
+        const GDRIVE_LOGIN_HINT = 'u0602538344@gmail.com'; // [FIX 3]
 
         // Tag constants
         const KERN_TAGS = ['projekt', 'entscheidung', 'person', 'emotional', 'konzept', 'referenz', 'meta'];
@@ -1178,11 +1183,11 @@ Nur JSON. Kein Kommentar.`;
         let conversationHistory = [];
         let isStreaming = false;
         let currentModel = 'sonnet';
-        let driveFileIds = { main: null, index: null };
+        let driveFileIds = { main: null, index: null, folder: null };
         let sessionId = 'sess-' + new Date().toISOString().slice(0, 10) + '-' + Math.random().toString(36).substr(2, 4);
 
         // ============================================================
-        // === WORKING MEMORY SYSTEM (unchanged logic) ===
+        // === WORKING MEMORY SYSTEM ===
         // ============================================================
         function loadMemory() {
             try {
@@ -1259,7 +1264,6 @@ Nur JSON. Kein Kommentar.`;
         function buildSystemPrompt() {
             let prompt = SYSTEM_PROMPT_BASE + formatMemoryForPrompt();
 
-            // Append Last Frame index if loaded
             const indexData = sessionStorage.getItem('loras_last_frame_index');
             if (indexData) {
                 prompt += '\n\n**Last Frame Index (dein Langzeitgedächtnis):**\n' + indexData;
@@ -1321,7 +1325,8 @@ Nur JSON. Kein Kommentar.`;
 
         async function driveConnect() {
             const verifier = generateCodeVerifier();
-            sessionStorage.setItem('gdrive_code_verifier', verifier);
+            // [FIX 1] Store verifier in localStorage so it survives the redirect
+            localStorage.setItem(GDRIVE_VERIFIER_KEY, verifier);
             const challenge = await generateCodeChallenge(verifier);
 
             const params = new URLSearchParams({
@@ -1332,7 +1337,8 @@ Nur JSON. Kein Kommentar.`;
                 code_challenge: challenge,
                 code_challenge_method: 'S256',
                 access_type: 'offline',
-                prompt: 'consent'
+                prompt: 'consent',
+                login_hint: GDRIVE_LOGIN_HINT  // [FIX 3] Pre-select Loras Soong account
             });
 
             window.location.href = 'https://accounts.google.com/o/oauth2/v2/auth?' + params.toString();
@@ -1341,12 +1347,22 @@ Nur JSON. Kein Kommentar.`;
         async function handleOAuthCallback() {
             const params = new URLSearchParams(window.location.search);
             const code = params.get('code');
+            const error = params.get('error');
+
+            if (error) {
+                console.error('OAuth error:', error);
+                showToast('OAuth Fehler: ' + error, 'error');
+                window.history.replaceState({}, '', window.location.pathname);
+                return false;
+            }
+
             if (!code) return false;
 
-            const verifier = sessionStorage.getItem('gdrive_code_verifier');
+            // [FIX 1] Read verifier from localStorage
+            const verifier = localStorage.getItem(GDRIVE_VERIFIER_KEY);
             if (!verifier) {
-                console.error('No code verifier found');
-                showToast('OAuth Fehler: Kein Verifier', 'error');
+                console.error('No code verifier found in localStorage');
+                showToast('OAuth Fehler: Kein Verifier gefunden', 'error');
                 window.history.replaceState({}, '', window.location.pathname);
                 return false;
             }
@@ -1377,35 +1393,100 @@ Nur JSON. Kein Kommentar.`;
                 };
 
                 localStorage.setItem(GDRIVE_TOKEN_KEY, JSON.stringify(tokenInfo));
-                sessionStorage.removeItem('gdrive_code_verifier');
+                // [FIX 1] Clean up verifier from localStorage
+                localStorage.removeItem(GDRIVE_VERIFIER_KEY);
                 window.history.replaceState({}, '', window.location.pathname);
 
                 updateDriveUI(true);
                 showToast('Google Drive verbunden', 'success');
+
+                // [FIX 2] Ensure folder exists after first connect
+                await ensureDriveFolder();
+
                 return true;
 
             } catch (err) {
                 console.error('Token exchange failed:', err);
-                showToast('Drive-Verbindung fehlgeschlagen', 'error');
+                showToast('Drive-Verbindung fehlgeschlagen: ' + err.message, 'error');
+                localStorage.removeItem(GDRIVE_VERIFIER_KEY);
                 window.history.replaceState({}, '', window.location.pathname);
                 return false;
             }
         }
 
-        function getDriveToken() {
+        // [FIX 4] Refresh token logic
+        async function refreshAccessToken() {
+            try {
+                const data = localStorage.getItem(GDRIVE_TOKEN_KEY);
+                if (!data) return null;
+                const tokenInfo = JSON.parse(data);
+
+                if (!tokenInfo.refresh_token) {
+                    // No refresh token — user must re-authenticate
+                    localStorage.removeItem(GDRIVE_TOKEN_KEY);
+                    updateDriveUI(false);
+                    return null;
+                }
+
+                const response = await fetch('https://oauth2.googleapis.com/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                        client_id: GDRIVE_CLIENT_ID,
+                        refresh_token: tokenInfo.refresh_token,
+                        grant_type: 'refresh_token'
+                    })
+                });
+
+                const newTokenData = await response.json();
+
+                if (newTokenData.error) {
+                    console.error('Token refresh failed:', newTokenData.error);
+                    localStorage.removeItem(GDRIVE_TOKEN_KEY);
+                    updateDriveUI(false);
+                    return null;
+                }
+
+                // Update stored token (keep the refresh_token, update access_token)
+                tokenInfo.access_token = newTokenData.access_token;
+                tokenInfo.expires_at = Date.now() + (newTokenData.expires_in * 1000);
+                // Google may issue a new refresh token
+                if (newTokenData.refresh_token) {
+                    tokenInfo.refresh_token = newTokenData.refresh_token;
+                }
+
+                localStorage.setItem(GDRIVE_TOKEN_KEY, JSON.stringify(tokenInfo));
+                console.log('Drive token refreshed successfully');
+                return tokenInfo.access_token;
+
+            } catch (err) {
+                console.error('Token refresh error:', err);
+                localStorage.removeItem(GDRIVE_TOKEN_KEY);
+                updateDriveUI(false);
+                return null;
+            }
+        }
+
+        // [FIX 4] Updated getDriveToken with auto-refresh
+        async function getDriveToken() {
             try {
                 const data = localStorage.getItem(GDRIVE_TOKEN_KEY);
                 if (!data) return null;
                 const token = JSON.parse(data);
+
                 // Check if expired (with 5min buffer)
                 if (token.expires_at && Date.now() > token.expires_at - 300000) {
-                    // Token expired — for PKCE without refresh token, user needs to re-auth
-                    if (!token.refresh_token) {
+                    if (token.refresh_token) {
+                        // Try to refresh
+                        const newToken = await refreshAccessToken();
+                        return newToken;
+                    } else {
+                        // No refresh token — must re-auth
                         localStorage.removeItem(GDRIVE_TOKEN_KEY);
+                        updateDriveUI(false);
+                        showToast('Drive-Token abgelaufen — bitte neu verbinden', 'error');
                         return null;
                     }
-                    // If we have a refresh token, we'd refresh here (Phase 2)
-                    return null;
                 }
                 return token.access_token;
             } catch {
@@ -1413,14 +1494,26 @@ Nur JSON. Kein Kommentar.`;
             }
         }
 
+        // Synchronous check for UI state (doesn't refresh)
         function isDriveConnected() {
-            return getDriveToken() !== null;
+            try {
+                const data = localStorage.getItem(GDRIVE_TOKEN_KEY);
+                if (!data) return false;
+                const token = JSON.parse(data);
+                // If we have a refresh token, consider it connected even if access token expired
+                if (token.refresh_token) return true;
+                // Otherwise check expiry
+                if (token.expires_at && Date.now() > token.expires_at) return false;
+                return true;
+            } catch {
+                return false;
+            }
         }
 
         function driveDisconnect() {
             if (!confirm('Google Drive Verbindung trennen?')) return;
             localStorage.removeItem(GDRIVE_TOKEN_KEY);
-            driveFileIds = { main: null, index: null };
+            driveFileIds = { main: null, index: null, folder: null };
             updateDriveUI(false);
             showToast('Drive getrennt', 'success');
         }
@@ -1448,14 +1541,66 @@ Nur JSON. Kein Kommentar.`;
         }
 
         // ============================================================
-        // === GOOGLE DRIVE — File Operations ===
+        // === GOOGLE DRIVE — Folder & File Operations ===
         // ============================================================
+
+        // [FIX 2] Find or create the Loras-Memory folder
+        async function ensureDriveFolder() {
+            const token = await getDriveToken();
+            if (!token) return null;
+
+            // Check if we already have the folder ID cached
+            if (driveFileIds.folder) return driveFileIds.folder;
+
+            try {
+                // Search for existing folder
+                const query = encodeURIComponent(`name='${DRIVE_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+                const res = await fetch(
+                    `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name)`,
+                    { headers: { 'Authorization': `Bearer ${token}` } }
+                );
+                const data = await res.json();
+
+                if (data.files && data.files.length > 0) {
+                    driveFileIds.folder = data.files[0].id;
+                    console.log('Found existing Loras-Memory folder:', driveFileIds.folder);
+                    return driveFileIds.folder;
+                }
+
+                // Create the folder
+                const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        name: DRIVE_FOLDER_NAME,
+                        mimeType: 'application/vnd.google-apps.folder'
+                    })
+                });
+                const folderData = await createRes.json();
+                driveFileIds.folder = folderData.id;
+                console.log('Created Loras-Memory folder:', driveFileIds.folder);
+                return driveFileIds.folder;
+
+            } catch (err) {
+                console.error('Folder setup error:', err);
+                return null;
+            }
+        }
+
         async function driveFindFile(name) {
-            const token = getDriveToken();
+            const token = await getDriveToken();
             if (!token) return null;
 
             try {
-                const query = encodeURIComponent(`name='${name}' and trashed=false`);
+                // Search within the Loras-Memory folder if available
+                let queryParts = [`name='${name}'`, 'trashed=false'];
+                if (driveFileIds.folder) {
+                    queryParts.push(`'${driveFileIds.folder}' in parents`);
+                }
+                const query = encodeURIComponent(queryParts.join(' and '));
                 const res = await fetch(
                     `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name)`,
                     { headers: { 'Authorization': `Bearer ${token}` } }
@@ -1469,7 +1614,7 @@ Nur JSON. Kein Kommentar.`;
         }
 
         async function driveReadFile(fileId) {
-            const token = getDriveToken();
+            const token = await getDriveToken();
             if (!token || !fileId) return null;
 
             try {
@@ -1485,7 +1630,7 @@ Nur JSON. Kein Kommentar.`;
         }
 
         async function driveWriteFile(name, content, existingFileId) {
-            const token = getDriveToken();
+            const token = await getDriveToken();
             if (!token) return null;
 
             const jsonStr = JSON.stringify(content, null, 2);
@@ -1507,8 +1652,13 @@ Nur JSON. Kein Kommentar.`;
                     const data = await res.json();
                     return data.id;
                 } else {
-                    // Create new file (multipart)
-                    const metadata = { name: name, mimeType: 'application/json' };
+                    // Create new file in Loras-Memory folder
+                    const folderId = driveFileIds.folder || await ensureDriveFolder();
+                    const metadata = {
+                        name: name,
+                        mimeType: 'application/json',
+                        parents: folderId ? [folderId] : []  // [FIX 2] Place in folder
+                    };
                     const boundary = 'loras_boundary_' + Date.now();
                     const body = [
                         `--${boundary}`,
@@ -1545,6 +1695,9 @@ Nur JSON. Kein Kommentar.`;
         async function ensureDriveFiles() {
             if (!isDriveConnected()) return false;
 
+            // Ensure folder exists first
+            await ensureDriveFolder();
+
             if (!driveFileIds.main) {
                 driveFileIds.main = await driveFindFile(DRIVE_MAIN_FILE);
             }
@@ -1577,7 +1730,6 @@ Nur JSON. Kein Kommentar.`;
             const indexData = await loadLastFrameIndex();
             if (!indexData) return;
 
-            // Format for system prompt
             let formatted = `Einträge: ${indexData.total_entries || 0} | Letztes Update: ${indexData.last_updated || 'unbekannt'}\n`;
 
             if (indexData.tag_registry) {
@@ -1587,7 +1739,6 @@ Nur JSON. Kein Kommentar.`;
                 }
             }
 
-            // Last 10 entries as summaries
             const entries = indexData.entries || [];
             const recent = entries.slice(-10);
             if (recent.length > 0) {
@@ -1619,7 +1770,6 @@ Nur JSON. Kein Kommentar.`;
             confirmBtn.style.display = 'none';
             progressEl.style.display = 'block';
             resultEl.innerHTML = '';
-            closeBtn.querySelector ? null : null;
 
             const apiKey = localStorage.getItem('loras_api_key');
             if (!apiKey) {
@@ -1628,7 +1778,6 @@ Nur JSON. Kein Kommentar.`;
                 return;
             }
 
-            // Build messages: full chat history + SESSION_END prompt
             const messages = [...conversationHistory, { role: 'user', content: SESSION_END_PROMPT }];
 
             let jsonResponse = null;
@@ -1668,12 +1817,10 @@ Nur JSON. Kein Kommentar.`;
                     const data = await response.json();
                     var lastRawResponse = data.content[0]?.text || '';
 
-                    // Try to parse JSON
                     const trimmed = lastRawResponse.trim();
                     try {
                         jsonResponse = JSON.parse(trimmed);
                     } catch {
-                        // Try to extract JSON from markdown code blocks
                         const jsonMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
                         if (jsonMatch) {
                             try { jsonResponse = JSON.parse(jsonMatch[1].trim()); } catch { /* nope */ }
@@ -1691,14 +1838,12 @@ Nur JSON. Kein Kommentar.`;
 
             progressEl.style.display = 'none';
 
-            // Handle the response
             if (!jsonResponse) {
                 resultEl.innerHTML = '<div class="session-end-result error"><div class="result-title">JSON Parse Fehler</div>Loras hat kein valides JSON geliefert. Nichts gespeichert.</div>';
                 closeBtn.textContent = 'Schließen';
                 return;
             }
 
-            // Check for nothing_to_save
             if (jsonResponse.nothing_to_save === true) {
                 resultEl.innerHTML = '<div class="session-end-result success"><div class="result-title">Nichts zu speichern</div>Loras hat entschieden: Diese Session hat nichts Langfristiges produziert.</div>';
                 closeBtn.textContent = 'Session beenden';
@@ -1706,7 +1851,6 @@ Nur JSON. Kein Kommentar.`;
                 return;
             }
 
-            // Process entries
             const entries = Array.isArray(jsonResponse) ? jsonResponse : [jsonResponse];
 
             if (entries.length === 0) {
@@ -1716,7 +1860,6 @@ Nur JSON. Kein Kommentar.`;
                 return;
             }
 
-            // Save to Drive if connected
             if (isDriveConnected()) {
                 progressEl.style.display = 'block';
                 progressText.textContent = 'Speichere in Google Drive...';
@@ -1730,7 +1873,6 @@ Nur JSON. Kein Kommentar.`;
                     resultEl.innerHTML = `<div class="session-end-result error"><div class="result-title">Drive Fehler</div>${err.message}<br><br>Entries im JSON-Format:<br><code>${JSON.stringify(entries, null, 2)}</code></div>`;
                 }
             } else {
-                // Not connected — show JSON for manual handling
                 resultEl.innerHTML = `<div class="session-end-result success"><div class="result-title">${entries.length} Eintrag/Einträge (nicht gespeichert — kein Drive)</div>Drive nicht verbunden. Entries:<br><code style="font-size:10px;word-break:break-all">${JSON.stringify(entries, null, 2)}</code></div>`;
             }
 
@@ -1741,7 +1883,6 @@ Nur JSON. Kein Kommentar.`;
         async function saveEntriesToDrive(entries) {
             await ensureDriveFiles();
 
-            // Load existing data
             let mainData = driveFileIds.main ? await driveReadFile(driveFileIds.main) : [];
             let indexData = driveFileIds.index ? await driveReadFile(driveFileIds.index) : null;
 
@@ -1762,26 +1903,21 @@ Nur JSON. Kein Kommentar.`;
                 const id = `mem-${String(nextId).padStart(3, '0')}`;
                 nextId++;
 
-                // Validate and fix tags
                 let tags = entry.tags || ['meta'];
                 if (tags.length > 5) tags = tags.slice(0, 5);
                 if (!KERN_TAGS.includes(tags[0])) tags[0] = 'meta';
 
-                // Validate weight
                 let weight = parseFloat(entry.weight) || 0.5;
                 weight = Math.max(0.0, Math.min(1.0, weight));
 
-                // Validate related
                 let related = Array.isArray(entry.related) ? entry.related : [];
 
-                // Check for validation warnings
                 let validationWarning = false;
                 for (const rel of related) {
                     const refExists = indexData.entries.some(e => e.id === rel.ref);
                     if (!refExists) validationWarning = true;
                 }
 
-                // Build full entry
                 const fullEntry = {
                     id: id,
                     timestamp: now,
@@ -1790,7 +1926,7 @@ Nur JSON. Kein Kommentar.`;
                     content: entry.content || '',
                     context: entry.context || '',
                     related: related,
-                    tagged_by: CURRENT_AGENT.id, // deprecated but kept
+                    tagged_by: CURRENT_AGENT.id,
                     review: null,
                     agent: { ...CURRENT_AGENT },
                     meta: {
@@ -1803,7 +1939,6 @@ Nur JSON. Kein Kommentar.`;
 
                 mainData.push(fullEntry);
 
-                // Build index entry
                 const indexEntry = {
                     id: id,
                     agent_id: CURRENT_AGENT.id,
@@ -1817,7 +1952,6 @@ Nur JSON. Kein Kommentar.`;
 
                 indexData.entries.push(indexEntry);
 
-                // Update tag registry
                 for (const tag of tags) {
                     if (!KERN_TAGS.includes(tag) && !indexData.tag_registry.frei.includes(tag)) {
                         indexData.tag_registry.frei.push(tag);
@@ -1828,7 +1962,6 @@ Nur JSON. Kein Kommentar.`;
             indexData.total_entries = mainData.length;
             indexData.last_updated = now;
 
-            // Write to Drive
             const mainFileId = await driveWriteFile(DRIVE_MAIN_FILE, mainData, driveFileIds.main);
             const indexFileId = await driveWriteFile(DRIVE_INDEX_FILE, indexData, driveFileIds.index);
 
@@ -1881,7 +2014,6 @@ Nur JSON. Kein Kommentar.`;
                 </div>`;
             setStatus('connected', 'Bereit');
 
-            // Load index for new session if toggle is on
             loadIndexForSession();
         }
 
@@ -2110,7 +2242,6 @@ Nur JSON. Kein Kommentar.`;
                 return;
             }
 
-            // Check for [END SESSION] keyword
             if (text === '[END SESSION]') {
                 input.value = '';
                 autoResize(input);
@@ -2118,18 +2249,15 @@ Nur JSON. Kein Kommentar.`;
                 return;
             }
 
-            // Hide welcome
             const welcome = document.getElementById('welcome');
             if (welcome) welcome.style.display = 'none';
 
-            // Add user message
             addMessage('user', text);
             conversationHistory.push({ role: 'user', content: text });
             input.value = '';
             autoResize(input);
             updateSendButton();
 
-            // Show typing & stream
             isStreaming = true;
             setStatus('', 'Loras denkt...');
             const typingEl = showTyping();
@@ -2246,7 +2374,6 @@ Nur JSON. Kein Kommentar.`;
             setModel('sonnet');
             updateDriveUI(isDriveConnected());
 
-            // Load index if toggle is on
             await loadIndexForSession();
 
             document.getElementById('inputField').focus();
